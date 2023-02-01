@@ -1,8 +1,9 @@
+import ws, { WebSocket } from 'ws'
 import cluster from 'cluster'
 import { EventEmitter } from 'stream'
 import { IncomingMessage as IncomingHttpMessage } from 'http'
-import { WebSocket } from 'ws'
 
+import { ContextMetadata, Factory } from '../@types/base'
 import { createNoticeMessage, createOutgoingEventMessage } from '../utils/messages'
 import { IAbortable, IMessageHandler } from '../@types/message-handlers'
 import { IncomingMessage, OutgoingMessage } from '../@types/messages'
@@ -10,13 +11,30 @@ import { IWebSocketAdapter, IWebSocketServerAdapter } from '../@types/adapters'
 import { SubscriptionFilter, SubscriptionId } from '../@types/subscription'
 import { WebSocketAdapterEvent, WebSocketServerAdapterEvent } from '../constants/adapter'
 import { attemptValidation } from '../utils/validation'
+import { ContextMetadataKey } from '../constants/base'
 import { createLogger } from '../factories/logger-factory'
 import { Event } from '../@types/event'
-import { Factory } from '../@types/base'
+import { getRemoteAddress } from '../utils/http'
 import { IRateLimiter } from '../@types/utils'
-import { ISettings } from '../@types/settings'
 import { isEventMatchingFilter } from '../utils/event'
 import { messageSchema } from '../schemas/message-schema'
+import { Settings } from '../@types/settings'
+import { SocketAddress } from 'net'
+
+(() => {
+  (ws as any).Receiver.prototype._write = function _write (chunk: any, _encoding: any, cb: any) {
+    if (this._opcode === 0x08 && this._state == 0) return cb()
+
+    this._bufferedBytes += chunk.length
+    this._buffers.push(chunk)
+    try {
+      this.startLoop(cb)
+    } catch (error) {
+      console.error('what in the world', error)
+      cb(error)
+    }
+  }
+})()
 
 const debug = createLogger('web-socket-adapter')
 const debugHeartbeat = debug.extend('heartbeat')
@@ -25,7 +43,7 @@ const abortableMessageHandlers: WeakMap<WebSocket, IAbortable[]> = new WeakMap()
 
 export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter {
   public clientId: string
-  private clientAddress: string
+  private clientAddress: SocketAddress
   private alive: boolean
   private subscriptions: Map<SubscriptionId, SubscriptionFilter[]>
 
@@ -35,27 +53,35 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
     private readonly webSocketServer: IWebSocketServerAdapter,
     private readonly createMessageHandler: Factory<IMessageHandler, [IncomingMessage, IWebSocketAdapter]>,
     private readonly slidingWindowRateLimiter: Factory<IRateLimiter>,
-    private readonly settings: Factory<ISettings>,
+    private readonly settings: Factory<Settings>,
   ) {
     super()
     this.alive = true
     this.subscriptions = new Map()
 
     this.clientId = Buffer.from(this.request.headers['sec-websocket-key'] as string, 'base64').toString('hex')
-    const remoteIpHeader = this.settings().network?.remote_ip_header ?? 'x-forwarded-for'
-    this.clientAddress = (this.request.headers[remoteIpHeader] ?? this.request.socket.remoteAddress) as string
+
+    const address = getRemoteAddress(this.request, this.settings())
+
+    this.clientAddress = new SocketAddress({
+      address: address,
+      family: address.indexOf(':') >= 0 ? 'ipv6' : 'ipv4',
+    })
+
+    console.log(`web-socket-adapter: new client ${this.clientId} (${this.getClientAddress()}) - ${(this.webSocketServer as any).webSocketServer.clients.size} total on worker ${process.pid}`)
 
     this.client
+      .on('error', (error) => {
+        if (error.name === 'RangeError' && error.message === 'Max payload size exceeded') {
+          console.error(`web-socket-adapter: client ${this.clientId} (${this.getClientAddress()}) sent payload too large`)
+        } else {
+          console.error(`web-socket-adapter: client error ${this.clientId} (${this.getClientAddress()}):`, error)
+        }
+      })
       .on('message', this.onClientMessage.bind(this))
       .on('close', this.onClientClose.bind(this))
       .on('pong', this.onClientPong.bind(this))
-      .on('error', (error) => {
-        if (error.name === 'RangeError' && error.message === 'Max payload size exceeded') {
-          debug('client %s from %s sent payload too large', this.clientId, this.clientAddress)
-        } else {
-          debug('error', error)
-        }
-      })
+      .on('ping', this.onClientPing.bind(this))
 
     this
       .on(WebSocketAdapterEvent.Heartbeat, this.onHeartbeat.bind(this))
@@ -65,7 +91,7 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
       .on(WebSocketAdapterEvent.Broadcast, this.onBroadcast.bind(this))
       .on(WebSocketAdapterEvent.Message, this.sendMessage.bind(this))
 
-    debug('client %s connected from %s', this.clientId, this.clientAddress)
+    debug('client %s connected from %s', this.clientId, this.clientAddress.address)
   }
 
   public getClientId(): string {
@@ -73,7 +99,7 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
   }
 
   public getClientAddress(): string {
-    return this.clientAddress
+    return this.clientAddress.address
   }
 
   public onUnsubscribed(subscriptionId: string): void {
@@ -108,12 +134,15 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
   }
 
   private sendMessage(message: OutgoingMessage): void {
+    if (this.client.readyState !== WebSocket.OPEN) {
+      return
+    }
     this.client.send(JSON.stringify(message))
   }
 
   public onHeartbeat(): void {
     if (!this.alive) {
-      debug('client %s pong timed out', this.clientId)
+      console.error(`web-socket-adapter: pong timeout for client ${this.clientId} (${this.getClientAddress()})`)
       this.terminate()
       return
     }
@@ -137,16 +166,20 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
     let abortable = false
     let messageHandler: IMessageHandler & IAbortable | undefined = undefined
     try {
-      if (await this.isRateLimited(this.clientAddress)) {
+      if (await this.isRateLimited(this.clientAddress.address)) {
         this.sendMessage(createNoticeMessage('rate limited'))
         return
       }
 
       const message = attemptValidation(messageSchema)(JSON.parse(raw.toString('utf8')))
 
+      message[ContextMetadataKey] = {
+        remoteAddress: this.clientAddress,
+      } as ContextMetadata
+
       messageHandler = this.createMessageHandler([message, this]) as IMessageHandler & IAbortable
       if (!messageHandler) {
-        debug('unhandled message: no handler found: %o', message)
+        console.error('web-socket-adapter: unhandled message: no handler found:', message)
         return
       }
 
@@ -162,17 +195,17 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
     } catch (error) {
       if (error instanceof Error) {
         if (error.name === 'AbortError') {
-          debug('message handler aborted')
+          console.error(`web-socket-adapter: abort from client ${this.clientId} (${this.getClientAddress()})`)
         } else if (error.name === 'SyntaxError' || error.name === 'ValidationError') {
           if (typeof (error as any).annotate === 'function') {
-            debug('invalid message: %o', (error as any).annotate())
+            debug('invalid message client %s (%s): %o', this.clientId, this.getClientAddress(), (error as any).annotate())
           } else {
-            debug('malformed message: %s', error.message)
+            console.error(`web-socket-adapter: malformed message from client ${this.clientId} (${this.getClientAddress()}):`, error.message)
           }
           this.sendMessage(createNoticeMessage(`invalid: ${error.message}`))
         }
       } else {
-        console.error('unable to handle message', error)
+        console.error('web-socket-adapter: unable to handle message:', error)
       }
     } finally {
       if (abortable && messageHandler) {
@@ -203,10 +236,10 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
       rateLimiter.hit(
         `${client}:message:${period}`,
         1,
-        { period: period, rate: rate },
+        { period, rate },
       )
 
-
+    let limited = false
     for (const { rate, period } of rateLimits) {
       const isRateLimited = await hit(period, rate)
 
@@ -214,15 +247,21 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
       if (isRateLimited) {
         debug('rate limited %s: %d messages / %d ms exceeded', client, rate, period)
 
-        return true
+        limited = true
       }
     }
 
-    return false
+    return limited
   }
 
   private onClientPong() {
     debugHeartbeat('client %s pong', this.clientId)
+    this.alive = true
+  }
+
+  private onClientPing(data: any) {
+    debugHeartbeat('client %s ping', this.clientId)
+    this.client.pong(data)
     this.alive = true
   }
 
@@ -233,13 +272,17 @@ export class WebSocketAdapter extends EventEmitter implements IWebSocketAdapter 
     const handlers = abortableMessageHandlers.get(this.client)
     if (Array.isArray(handlers) && handlers.length) {
       for (const handler of handlers) {
-        handler.abort()
+        try {
+          handler.abort()
+        } catch (error) {
+          console.error('Unable to abort message handler', error)
+        }
       }
     }
 
     this.removeAllListeners()
     this.client.removeAllListeners()
 
-    debug('client %s closed', this.clientId)
+    console.error(`web-socket-adapter: disconnected client ${this.clientId} (${this.getClientAddress()}) - ${(this.webSocketServer as any).webSocketServer.clients.size} total on worker ${process.pid}`)
   }
 }
